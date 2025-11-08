@@ -19,7 +19,7 @@
 
 If you find this project helpful, consider supporting the development:
 
-**Trakteer:** [teer.id/rama_adhitya_setiadi](https://teer.id/rama_adhitya_setiadi)
+**Trakteer:** [teer.id/rama_adhitya_setiadi](https://trakteer.id/rama_adhitya_setiadi/tip)
 
 ---
 
