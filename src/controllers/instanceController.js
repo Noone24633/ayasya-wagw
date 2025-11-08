@@ -4,25 +4,33 @@ const whatsappService = require('../services/whatsappService');
 class InstanceController {
   async create(req, res) {
     try {
-      const { name, id, webhookUrl } = req.body;
-      
+      const { name, id, webhookUrl, phoneNumber } = req.body;
+
       if (!name) {
         return res.status(400).json({
           success: false,
           error: 'Instance name is required'
         });
       }
-      
+
+      if (!phoneNumber) {
+        return res.status(400).json({
+          success: false,
+          error: 'Phone number is required'
+        });
+      }
+
       const instance = await sessionManager.createInstance({
         id,
         name,
-        webhookUrl
+        webhookUrl,
+        phoneNumber
       });
-      
+
       res.status(201).json({
         success: true,
         data: instance,
-        message: 'Instance created successfully. Please scan the QR code.'
+        message: 'Instance created successfully. Please scan the QR code or request pairing code.'
       });
     } catch (error) {
       console.error('Error creating instance:', error);

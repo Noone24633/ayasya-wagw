@@ -1,4 +1,4 @@
-const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, delay, requestPairingCode } = require('baileys');
+const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, delay } = require('baileys');
 
 const { Boom } = require('@hapi/boom');
 const qrcode = require('qrcode');
@@ -697,8 +697,11 @@ class WhatsAppService {
     const { socket } = instance;
 
     try {
-      const pairingCode = await requestPairingCode(phoneNumber, socket);
-      console.log(`Pairing code requested for ${phoneNumber}: ${pairingCode}`);
+      // Ensure phone number is in E.164 format without plus sign
+      const cleanPhoneNumber = phoneNumber.replace(/^\+/, '');
+
+      const pairingCode = await socket.requestPairingCode(cleanPhoneNumber);
+      console.log(`Pairing code requested for ${cleanPhoneNumber}: ${pairingCode}`);
 
       // Store pairing code in memory
       instance.pairingCode = pairingCode;

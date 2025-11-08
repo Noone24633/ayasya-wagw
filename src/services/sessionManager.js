@@ -9,28 +9,30 @@ class SessionManager {
 
   async createInstance(data) {
     const prisma = database.getInstance();
-    
+
     try {
       // Create instance in database
       const instance = await prisma.instance.create({
         data: {
           id: data.id || uuidv4(),
           name: data.name,
+          phoneNumber: data.phoneNumber,
           webhookUrl: data.webhookUrl || null,
           status: 'disconnected'
         }
       });
-      
+
       // Initialize WhatsApp connection
       await whatsappService.init(instance.id);
-      
+
       // Store in memory
       this.sessions.set(instance.id, {
         id: instance.id,
         name: instance.name,
+        phoneNumber: instance.phoneNumber,
         createdAt: instance.createdAt
       });
-      
+
       return instance;
     } catch (error) {
       console.error('Error creating instance:', error);
