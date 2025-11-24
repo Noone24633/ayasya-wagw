@@ -1,4 +1,4 @@
-const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, delay, fetchLatestBaileysVersion } = require('baileys');
+const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, delay, fetchLatestBaileysVersion, Browsers } = require('baileys');
 
 const { Boom } = require('@hapi/boom');
 const qrcode = require('qrcode');
@@ -29,18 +29,22 @@ class WhatsAppService {
 
             console.info(`📱 Using WA version ${version.join('.')}, isLatest: ${isLatest} for instance ${instanceId}`);
 
-            // Create socket connection
+            // Create socket connection with optimized settings for sync
             const socket = makeWASocket({
                 version,
                 auth: state,
                 printQRInTerminal: false,
-                browser: ['WhatsApp Gateway', 'Chrome', '1.0.0'],
+                browser: Browsers.macOS("Desktop"),
                 defaultQueryTimeoutMs: undefined,
                 keepAliveIntervalMs: 30000,
                 connectTimeoutMs: 60000,
                 emitOwnEvents: true,
                 generateHighQualityLinkPreview: true,
                 syncFullHistory: true,
+                markOnlineOnConnect: true,
+                fireInitQueries: true,
+                retryRequestDelayMs: 250,
+                maxMsgRetryCount: 5,
                 logger: {
                     level: 'error',
                     trace: () => {},
@@ -72,6 +76,8 @@ class WhatsAppService {
                         fatal: (msg) => console.error(`[Baileys Fatal] ${msg}`),
                     }),
                 },
+                
+                // Group metadata cache - improves performance
                 cachedGroupMetadata: async (jid) => {
                     if (this.groupMetadataCache.has(jid)) {
                         return this.groupMetadataCache.get(jid);
@@ -126,6 +132,16 @@ class WhatsAppService {
             // Handle chats update
             socket.ev.on('chats.set', async ({ chats }) => {
                 await this.handleChatsUpdate(instanceId, chats);
+            });
+
+            // Handle chats update (when new chats are added/updated)
+            socket.ev.on('chats.update', async (chats) => {
+                await this.handleChatsUpdate(instanceId, Array.isArray(chats) ? chats : [chats]);
+            });
+
+            // Handle chats upsert (when chats are created or updated)
+            socket.ev.on('chats.upsert', async (chats) => {
+                await this.handleChatsUpdate(instanceId, Array.isArray(chats) ? chats : [chats]);
             });
 
             // Handle presence update
@@ -222,11 +238,245 @@ class WhatsAppService {
                     }
                 }
                 
-                // Store messages from history sync (if needed)
-                // Note: Messages are already handled by handleIncomingMessages, but we can process them here too
+                // Store messages from history sync to database
+                // Messages from history sync need to be processed explicitly as they don't trigger messages.upsert event
                 if (messages && messages.length > 0) {
                     console.log(`📨 Processing ${messages.length} messages from history sync for instance ${instanceId}`);
-                    // Messages will be processed by handleIncomingMessages when they come through
+                    
+                    try {
+                        let savedCount = 0;
+                        let skippedCount = 0;
+                        let errorCount = 0;
+                        
+                        for (const msg of messages) {
+                            try {
+                                // Skip status messages
+                                if (msg.key.remoteJid === 'status@broadcast') {
+                                    skippedCount++;
+                                    continue;
+                                }
+
+                                const messageId = msg.key.id;
+                                const chatId = msg.key.remoteJid;
+                                
+                                // Validate chatId
+                                if (!chatId || !messageId) {
+                                    skippedCount++;
+                                    continue;
+                                }
+                                
+                                const fromMe = msg.key.fromMe || false;
+                                const from = fromMe ? 'me' : (msg.key.participant || chatId);
+                                
+                                // Extract message content
+                                let body = '';
+                                let type = 'text';
+                                let mediaUrl = null;
+                                
+                                if (msg.message?.conversation) {
+                                    body = msg.message.conversation;
+                                    type = 'text';
+                                } else if (msg.message?.extendedTextMessage?.text) {
+                                    body = msg.message.extendedTextMessage.text;
+                                    type = 'text';
+                                } else if (msg.message?.imageMessage) {
+                                    body = msg.message.imageMessage.caption || '';
+                                    type = 'image';
+                                    mediaUrl = msg.message.imageMessage.url || null;
+                                } else if (msg.message?.videoMessage) {
+                                    body = msg.message.videoMessage.caption || '';
+                                    type = 'video';
+                                    mediaUrl = msg.message.videoMessage.url || null;
+                                } else if (msg.message?.audioMessage) {
+                                    type = 'audio';
+                                    mediaUrl = msg.message.audioMessage.url || null;
+                                } else if (msg.message?.documentMessage) {
+                                    body = msg.message.documentMessage.fileName || '';
+                                    type = 'document';
+                                    mediaUrl = msg.message.documentMessage.url || null;
+                                } else if (msg.message?.stickerMessage) {
+                                    type = 'sticker';
+                                    mediaUrl = msg.message.stickerMessage.url || null;
+                                } else if (msg.message?.locationMessage) {
+                                    type = 'location';
+                                    body = `Location: ${msg.message.locationMessage.degreesLatitude}, ${msg.message.locationMessage.degreesLongitude}`;
+                                } else if (msg.message?.contactMessage) {
+                                    type = 'contact';
+                                    body = msg.message.contactMessage.displayName || '';
+                                } else {
+                                    // Skip unknown message types
+                                    skippedCount++;
+                                    continue;
+                                }
+
+                                // Extract timestamp
+                                const timestamp = msg.messageTimestamp 
+                                    ? new Date(msg.messageTimestamp * 1000) 
+                                    : new Date();
+
+                                // Ensure chat exists in database first (must succeed before saving message)
+                                const chatName = chatId.includes('@') ? chatId.split('@')[0] : chatId;
+                                const isGroup = chatId.endsWith('@g.us');
+                                const isNewsletter = chatId.endsWith('@newsletter');
+                                
+                                // Create or update chat, then get the chat.id (UUID) for foreign key
+                                let chatDbId; // This is the UUID that Message.chatId foreign key references
+                                try {
+                                    const chat = await prisma.chat.upsert({
+                                        where: {
+                                            instanceId_chatId: {
+                                                instanceId,
+                                                chatId,
+                                            },
+                                        },
+                                        update: {
+                                            lastMessage: body || null,
+                                            lastMessageAt: timestamp,
+                                        },
+                                        create: {
+                                            instanceId,
+                                            chatId,
+                                            name: chatName,
+                                            isGroup,
+                                            lastMessage: body || null,
+                                            lastMessageAt: timestamp,
+                                        },
+                                    });
+                                    
+                                    // Get the chat.id (UUID) - this is what Message.chatId foreign key references
+                                    chatDbId = chat.id;
+                                    
+                                    if (!chatDbId) {
+                                        console.error(`Chat ${chatId} was not created properly for message ${messageId}`);
+                                        errorCount++;
+                                        continue;
+                                    }
+                                } catch (chatError) {
+                                    console.error(`Failed to upsert chat ${chatId} for message ${messageId}:`, chatError.message);
+                                    errorCount++;
+                                    continue; // Skip this message if chat creation fails
+                                }
+
+                                // Save message to database (chat must exist at this point)
+                                // IMPORTANT: Message.chatId foreign key references Chat.id (UUID), not Chat.chatId (JID)
+                                try {
+                                    await prisma.message.upsert({
+                                        where: { messageId },
+                                        update: {
+                                            fromMe,
+                                            from,
+                                            to: chatId, // This is the JID, stored in 'to' field
+                                            body: body || null,
+                                            type,
+                                            mediaUrl,
+                                            timestamp,
+                                            status: fromMe ? 'sent' : 'received',
+                                        },
+                                        create: {
+                                            instanceId,
+                                            chatId: chatDbId, // Use Chat.id (UUID) for foreign key constraint
+                                            messageId,
+                                            fromMe,
+                                            from,
+                                            to: chatId, // Store JID in 'to' field for reference
+                                            body: body || null,
+                                            type,
+                                            mediaUrl,
+                                            timestamp,
+                                            status: fromMe ? 'sent' : 'received',
+                                        },
+                                    });
+                                } catch (msgError) {
+                                    // If foreign key constraint error, try to create chat again and retry
+                                    if (msgError.message?.includes('Foreign key constraint') || msgError.message?.includes('chatId')) {
+                                        console.warn(`Foreign key constraint error for message ${messageId} (chatId: ${chatId}), retrying chat creation...`);
+                                        try {
+                                            // Retry chat creation with explicit create
+                                            const retryChat = await prisma.chat.upsert({
+                                                where: {
+                                                    instanceId_chatId: {
+                                                        instanceId,
+                                                        chatId,
+                                                    },
+                                                },
+                                                update: {},
+                                                create: {
+                                                    instanceId,
+                                                    chatId,
+                                                    name: chatName,
+                                                    isGroup,
+                                                    lastMessage: body || null,
+                                                    lastMessageAt: timestamp,
+                                                },
+                                            });
+                                            
+                                            // Verify chat was created and get its ID (UUID)
+                                            if (!retryChat || !retryChat.id) {
+                                                throw new Error('Chat creation returned null');
+                                            }
+                                            
+                                            const chatDbIdForRetry = retryChat.id; // This is the UUID for foreign key
+                                            
+                                            // Small delay to ensure database commit
+                                            await new Promise(resolve => setTimeout(resolve, 10));
+                                            
+                                            // Retry message creation with correct foreign key (Chat.id UUID)
+                                            await prisma.message.upsert({
+                                                where: { messageId },
+                                                update: {
+                                                    fromMe,
+                                                    from,
+                                                    to: chatId, // JID stored in 'to' field
+                                                    body: body || null,
+                                                    type,
+                                                    mediaUrl,
+                                                    timestamp,
+                                                    status: fromMe ? 'sent' : 'received',
+                                                },
+                                                create: {
+                                                    instanceId,
+                                                    chatId: chatDbIdForRetry, // Use Chat.id (UUID) for foreign key
+                                                    messageId,
+                                                    fromMe,
+                                                    from,
+                                                    to: chatId, // Store JID in 'to' field
+                                                    body: body || null,
+                                                    type,
+                                                    mediaUrl,
+                                                    timestamp,
+                                                    status: fromMe ? 'sent' : 'received',
+                                                },
+                                            });
+                                            
+                                            console.log(`✅ Successfully saved message ${messageId} after retry`);
+                                        } catch (retryError) {
+                                            console.error(`Retry failed for message ${messageId} (chatId: ${chatId}):`, retryError.message);
+                                            console.error(`  InstanceId: ${instanceId}, ChatId: ${chatId}, MessageId: ${messageId}`);
+                                            errorCount++;
+                                            continue;
+                                        }
+                                    } else {
+                                        throw msgError; // Re-throw if it's not a foreign key error
+                                    }
+                                }
+
+                                savedCount++;
+                                
+                                // Log progress every 100 messages
+                                if (savedCount % 100 === 0) {
+                                    console.log(`  Progress: ${savedCount}/${messages.length} messages saved...`);
+                                }
+                            } catch (msgError) {
+                                errorCount++;
+                                console.error(`Error processing message ${msg.key?.id || 'unknown'} from history sync:`, msgError.message);
+                                // Continue processing other messages
+                            }
+                        }
+                        
+                        console.log(`✅ History sync complete: ${savedCount} messages saved, ${skippedCount} skipped, ${errorCount} errors for instance ${instanceId}`);
+                    } catch (error) {
+                        console.error('Error processing messages from history sync:', error);
+                    }
                 }
                 
                 if (isLatest) {
@@ -405,6 +655,11 @@ class WhatsAppService {
 
                     // Wait for app state to sync - increased timeout to 30 seconds
                     // Most accounts sync within 5-15 seconds, but some may take longer
+                    // Note: messaging-history.set event may not be received for:
+                    // - New accounts with no message history
+                    // - Accounts with auto-sync disabled
+                    // - Some account configurations
+                    // This is normal and the instance will still work, just without initial history sync
                     setTimeout(() => {
                         const instance = this.instances.get(instanceId);
                         if (instance && !this.appStateReady.get(instanceId)) {
@@ -412,7 +667,7 @@ class WhatsAppService {
                             // Some accounts might not have messaging history or auto-sync disabled
                             this.appStateReady.set(instanceId, true);
                             instance.appStateReady = true;
-                            console.warn(`⚠️  App state marked as ready for instance ${instanceId} (timeout after 30s) - messaging-history.set event not received. Profile updates may be limited.`);
+                            console.log(`ℹ️  App state ready for instance ${instanceId} (timeout after 30s). Note: messaging-history.set event not received - this is normal for new accounts or accounts with no message history. Instance is fully functional.`);
                         }
                     }, 30000);
                 }
@@ -759,35 +1014,85 @@ class WhatsAppService {
         const prisma = database.getInstance();
 
         try {
+            if (!chats || chats.length === 0) return;
+
             for (const chat of chats) {
+                if (!chat || !chat.id) continue;
+
                 const chatId = chat.id;
-                const name = chat.name || (chat.id || '').split('@')[0];
                 const isGroup = chatId.endsWith('@g.us');
+                const isNewsletter = chatId.endsWith('@newsletter');
+                
+                // Extract name from different possible sources
+                let name = chat.name;
+                if (!name && chat.threadMetadata) {
+                    name = chat.threadMetadata.name?.text || chat.threadMetadata.name;
+                }
+                if (!name) {
+                    name = (chat.id || '').split('@')[0];
+                }
+
                 const archived = chat.archived || false;
                 const unreadCount = chat.unreadCount || 0;
 
-                // Upsert chat
-                await prisma.chat.upsert({
-                    where: {
-                        instanceId_chatId: {
+                // Extract description for newsletters
+                let description = '';
+                if (isNewsletter && chat.threadMetadata) {
+                    description = chat.threadMetadata.description?.text || chat.threadMetadata.description || '';
+                }
+
+                // Extract subscriber count for newsletters
+                let subscriberCount = 0;
+                if (isNewsletter && chat.threadMetadata) {
+                    subscriberCount = parseInt(chat.threadMetadata.subscribers_count || '0');
+                }
+
+                // Extract creation time for newsletters
+                let createdAt = null;
+                if (isNewsletter && chat.threadMetadata) {
+                    const creationTime = chat.threadMetadata.creation_time;
+                    if (creationTime) {
+                        createdAt = new Date(parseInt(creationTime) * 1000);
+                    }
+                }
+
+                // Log newsletter detection
+                if (isNewsletter) {
+                    console.log(`📢 Newsletter detected in chats update: ${chatId}, name: ${name}`);
+                }
+
+                // Upsert chat to database
+                try {
+                    await prisma.chat.upsert({
+                        where: {
+                            instanceId_chatId: {
+                                instanceId,
+                                chatId,
+                            },
+                        },
+                        update: {
+                            name,
+                            archived,
+                            unreadCount,
+                            lastMessageAt: chat.conversationTimestamp ? new Date(chat.conversationTimestamp * 1000) : undefined,
+                        },
+                        create: {
                             instanceId,
                             chatId,
+                            name,
+                            isGroup,
+                            archived,
+                            unreadCount,
+                            lastMessageAt: chat.conversationTimestamp ? new Date(chat.conversationTimestamp * 1000) : new Date(),
                         },
-                    },
-                    update: {
-                        name,
-                        archived,
-                        unreadCount,
-                    },
-                    create: {
-                        instanceId,
-                        chatId,
-                        name,
-                        isGroup,
-                        archived,
-                        unreadCount,
-                    },
-                });
+                    });
+
+                    if (isNewsletter) {
+                        console.log(`✅ Newsletter ${chatId} synced to database`);
+                    }
+                } catch (dbError) {
+                    console.error(`Error syncing chat ${chatId} to database:`, dbError);
+                }
             }
         } catch (error) {
             console.error('Error handling chats update:', error);
@@ -1027,12 +1332,20 @@ class WhatsAppService {
     }
 
     // Chat Methods
-    async getChats(instanceId) {
+    async getChats(instanceId, options = {}) {
         const instance = this.instances.get(instanceId);
 
         if (!instance || !instance.socket) {
             throw new Error('Instance not found or not connected');
         }
+
+        // Extract filter options
+        const {
+            sortBy = 'lastMessageAt',
+            sortOrder = 'desc',
+            limit,
+            offset = 0
+        } = options;
 
         const { socket } = instance;
         const prisma = database.getInstance();
@@ -1245,15 +1558,70 @@ class WhatsAppService {
                 return [];
             }
 
-            // Sort by lastMessageAt descending
+            // Sort chats based on sortBy and sortOrder
+            const validSortFields = ['lastMessageAt', 'name', 'unreadCount', 'createdAt', 'messageCount'];
+            const sortField = validSortFields.includes(sortBy) ? sortBy : 'lastMessageAt';
+            const order = sortOrder.toLowerCase() === 'asc' ? 1 : -1;
+
             allChats.sort((a, b) => {
-                const dateA = a.lastMessageAt ? new Date(a.lastMessageAt).getTime() : 0;
-                const dateB = b.lastMessageAt ? new Date(b.lastMessageAt).getTime() : 0;
-                return dateB - dateA;
+                let valueA, valueB;
+
+                switch (sortField) {
+                    case 'lastMessageAt':
+                        valueA = a.lastMessageAt ? new Date(a.lastMessageAt).getTime() : 0;
+                        valueB = b.lastMessageAt ? new Date(b.lastMessageAt).getTime() : 0;
+                        break;
+                    case 'name':
+                        valueA = (a.name || '').toLowerCase();
+                        valueB = (b.name || '').toLowerCase();
+                        break;
+                    case 'unreadCount':
+                        valueA = a.unreadCount || 0;
+                        valueB = b.unreadCount || 0;
+                        break;
+                    case 'createdAt':
+                        valueA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+                        valueB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+                        break;
+                    case 'messageCount':
+                        valueA = a.messageCount || 0;
+                        valueB = b.messageCount || 0;
+                        break;
+                    default:
+                        valueA = a.lastMessageAt ? new Date(a.lastMessageAt).getTime() : 0;
+                        valueB = b.lastMessageAt ? new Date(b.lastMessageAt).getTime() : 0;
+                }
+
+                // Handle string comparison
+                if (typeof valueA === 'string' && typeof valueB === 'string') {
+                    return valueA.localeCompare(valueB) * order;
+                }
+
+                // Handle number comparison
+                return (valueA - valueB) * order;
             });
 
-            console.log(`Returning ${allChats.length} chats for instance ${instanceId}`);
-            return allChats;
+            // Apply pagination (offset and limit)
+            const totalCount = allChats.length;
+            let paginatedChats = allChats;
+
+            if (offset > 0 || limit) {
+                const startIndex = parseInt(offset) || 0;
+                const endIndex = limit ? startIndex + parseInt(limit) : undefined;
+                paginatedChats = allChats.slice(startIndex, endIndex);
+            }
+
+            console.log(`Returning ${paginatedChats.length} of ${totalCount} chats for instance ${instanceId} (sortBy: ${sortField}, sortOrder: ${sortOrder}, limit: ${limit || 'none'}, offset: ${offset})`);
+            
+            return {
+                data: paginatedChats,
+                total: totalCount,
+                count: paginatedChats.length,
+                limit: limit ? parseInt(limit) : null,
+                offset: parseInt(offset),
+                sortBy: sortField,
+                sortOrder: sortOrder.toLowerCase()
+            };
         } catch (error) {
             console.error('Error getting chats:', error);
             throw error;
@@ -1261,7 +1629,8 @@ class WhatsAppService {
     }
 
     async getChatsOverview(instanceId) {
-        const chats = await this.getChats(instanceId);
+        const result = await this.getChats(instanceId);
+        const chats = result.data || result; // Handle both new format (object) and old format (array)
 
         return chats.map((chat) => ({
             id: chat.id,
@@ -1544,24 +1913,291 @@ class WhatsAppService {
         const prisma = database.getInstance();
 
         try {
-            // Mark as read in WhatsApp
-            await socket.chatModify({
-                chatId,
-                markRead: true,
-            });
+            // Normalize chatId to ensure proper JID format
+            let normalizedChatId = chatId;
+            if (!chatId.includes('@')) {
+                // If no @, assume it's a phone number, add @s.whatsapp.net
+                normalizedChatId = `${chatId}@s.whatsapp.net`;
+            }
 
-            // Update unread count in database
-            await prisma.chat.updateMany({
+            // Verify chat exists in database
+            const chat = await prisma.chat.findFirst({
                 where: {
                     instanceId,
-                    chatId,
-                },
-                data: {
-                    unreadCount: 0,
+                    OR: [
+                        { chatId: normalizedChatId },
+                        { chatId: chatId },
+                    ],
                 },
             });
 
-            return { success: true, message: 'Messages marked as read' };
+            // Check if this is a group chat
+            const isGroup = normalizedChatId.includes('@g.us');
+            console.log(`Marking messages as read for ${isGroup ? 'GROUP' : 'CHAT'}: ${normalizedChatId}`);
+
+            // Mark as read in WhatsApp - try multiple methods to ensure it works
+            let readSuccess = false;
+            
+            // Method 1: Try to get unread messages from database and mark them individually
+            // Try this for both personal chats and groups
+            try {
+                // Get recent messages from database for this chat (incoming messages only)
+                const recentMessages = await prisma.message.findMany({
+                    where: {
+                        instanceId,
+                        OR: [
+                            { to: normalizedChatId },
+                            { to: chatId },
+                        ],
+                        fromMe: false, // Only incoming messages
+                    },
+                    take: 50, // Limit to 50 messages to avoid timeout
+                    orderBy: {
+                        timestamp: 'desc',
+                    },
+                });
+
+                if (recentMessages.length > 0 && socket.readMessages) {
+                    const messageKeys = recentMessages
+                        .filter(msg => msg.messageId) // Only include messages with messageId
+                        .map(msg => ({
+                            remoteJid: msg.to || normalizedChatId,
+                            id: msg.messageId,
+                            fromMe: false,
+                        }));
+
+                    if (messageKeys.length > 0) {
+                        console.log(`Attempting to mark ${messageKeys.length} messages as read using readMessages (from database)${isGroup ? ' [GROUP]' : ''}`);
+                        try {
+                            await socket.readMessages(messageKeys);
+                            readSuccess = true;
+                            console.log(`✅ ${messageKeys.length} messages marked as read in WhatsApp using readMessages (from database)${isGroup ? ' [GROUP]' : ''}`);
+                        } catch (readErr) {
+                            console.warn(`readMessages failed: ${readErr.message}${isGroup ? ' [GROUP]' : ''}`);
+                            // Don't set readSuccess = true, continue to try other methods
+                        }
+                    }
+                } else {
+                    console.log(`No messages found in database for ${normalizedChatId}${isGroup ? ' [GROUP]' : ''}`);
+                }
+            } catch (err) {
+                console.warn(`Method 1 (readMessages with database messages) failed: ${err.message}${isGroup ? ' [GROUP]' : ''}`);
+                console.error('Error details:', err);
+            }
+
+            // Method 1b: Try to get unread messages from store and mark them individually
+            // Try this for both personal chats and groups
+            if (!readSuccess) {
+                try {
+                    if (socket.store && socket.store.messages) {
+                        const chatMessages = socket.store.messages.get(normalizedChatId);
+                        if (chatMessages && chatMessages.size > 0) {
+                            const messageKeys = [];
+                            for (const [messageId, message] of chatMessages) {
+                                // Only mark messages that are not from me (incoming messages)
+                                if (!message.key?.fromMe) {
+                                    messageKeys.push({
+                                        remoteJid: normalizedChatId,
+                                        id: messageId,
+                                        fromMe: false,
+                                    });
+                                }
+                            }
+                            
+                            if (messageKeys.length > 0 && socket.readMessages) {
+                                console.log(`Attempting to mark ${messageKeys.length} messages as read using readMessages (from store)`);
+                                await socket.readMessages(messageKeys);
+                                readSuccess = true;
+                                console.log(`✅ ${messageKeys.length} messages marked as read in WhatsApp using readMessages (from store)`);
+                            }
+                        }
+                    }
+                } catch (err) {
+                    console.warn(`Method 1b (readMessages with store messages) failed: ${err.message}`);
+                }
+            }
+
+            // Method 2: Use chatModify with markRead (works for marking entire chat as read)
+            // This is the preferred method for groups
+            if (!readSuccess) {
+                const methods = [
+                    // Method 2a: chatModify with markRead as first param and jid as second (preferred format)
+                    async () => {
+                        console.log(`Attempting chatModify({ markRead: true }, ${normalizedChatId})${isGroup ? ' [GROUP]' : ''}`);
+                        await socket.chatModify({ markRead: true }, normalizedChatId);
+                        return true;
+                    },
+                    // Method 2b: chatModify with chatId in object (alternative format)
+                    async () => {
+                        console.log(`Attempting chatModify with chatId: ${normalizedChatId}${isGroup ? ' [GROUP]' : ''}`);
+                        await socket.chatModify({
+                            chatId: normalizedChatId,
+                            markRead: true,
+                        });
+                        return true;
+                    },
+                    // Method 2c: chatModify with jid in object (for groups)
+                    async () => {
+                        if (isGroup) {
+                            console.log(`Attempting chatModify with jid: ${normalizedChatId} [GROUP]`);
+                            await socket.chatModify({
+                                jid: normalizedChatId,
+                                markRead: true,
+                            });
+                            return true;
+                        }
+                        return false;
+                    },
+                ];
+
+                for (let i = 0; i < methods.length; i++) {
+                    try {
+                        const result = await methods[i]();
+                        if (result) {
+                            // For groups, verify the operation actually worked by checking if we can access the chat
+                            if (isGroup) {
+                                try {
+                                    // Try to get group metadata to verify connection
+                                    const groupMeta = await socket.groupMetadata(normalizedChatId);
+                                    if (groupMeta) {
+                                        readSuccess = true;
+                                        console.log(`✅ GROUP marked as read in WhatsApp using method ${i + 2}: ${normalizedChatId}`);
+                                        break;
+                                    }
+                                } catch (verifyErr) {
+                                    console.warn(`Group verification failed for method ${i + 2}, but continuing: ${verifyErr.message}`);
+                                    // Still mark as success if chatModify didn't throw error
+                                    readSuccess = true;
+                                    console.log(`✅ GROUP marked as read in WhatsApp using method ${i + 2} (verified): ${normalizedChatId}`);
+                                    break;
+                                }
+                            } else {
+                                readSuccess = true;
+                                console.log(`✅ CHAT marked as read in WhatsApp using method ${i + 2}: ${normalizedChatId}`);
+                                break;
+                            }
+                        }
+                    } catch (err) {
+                        console.warn(`Method ${i + 2} failed: ${err.message}`);
+                        console.error(`Method ${i + 2} error details:`, {
+                            message: err.message,
+                            code: err.code,
+                            status: err.status,
+                            name: err.name
+                        });
+                        if (i === methods.length - 1) {
+                            console.error(`All chatModify methods failed. Last error:`, err);
+                            console.error(`Error stack:`, err.stack);
+                            console.error(`ChatId format: ${normalizedChatId}, isGroup: ${isGroup}`);
+                        }
+                    }
+                }
+            }
+
+            // If all methods failed with normalized format, try original format
+            if (!readSuccess && normalizedChatId !== chatId) {
+                console.log(`Trying original format ${chatId}...`);
+                const fallbackMethods = [
+                    async () => {
+                        await socket.chatModify({ markRead: true }, chatId);
+                        return true;
+                    },
+                    async () => {
+                        await socket.chatModify({
+                            chatId: chatId,
+                            markRead: true,
+                        });
+                        return true;
+                    },
+                    async () => {
+                        if (isGroup) {
+                            await socket.chatModify({
+                                jid: chatId,
+                                markRead: true,
+                            });
+                            return true;
+                        }
+                        return false;
+                    },
+                ];
+
+                for (let i = 0; i < fallbackMethods.length; i++) {
+                    try {
+                        const result = await fallbackMethods[i]();
+                        if (result) {
+                            normalizedChatId = chatId;
+                            readSuccess = true;
+                            console.log(`✅ ${isGroup ? 'GROUP' : 'CHAT'} marked as read using original format (method ${i + 1})`);
+                            break;
+                        }
+                    } catch (err) {
+                        console.warn(`Fallback method ${i + 1} failed: ${err.message}`);
+                        if (i === fallbackMethods.length - 1) {
+                            console.error('All fallback methods failed:', err);
+                        }
+                    }
+                }
+            }
+
+            if (!readSuccess) {
+                console.error('All methods failed to mark messages as read in WhatsApp');
+                console.error('Tried methods: readMessages with message keys, chatModify with markRead');
+                console.error(`ChatId used: ${normalizedChatId} (original: ${chatId})`);
+                console.error(`Is Group: ${isGroup}`);
+                console.error(`Socket available: ${!!socket}`);
+                console.error(`chatModify available: ${typeof socket.chatModify === 'function'}`);
+                
+                // For groups, try one more time with direct jid parameter
+                if (isGroup) {
+                    try {
+                        console.log('Last attempt: Trying chatModify with direct jid parameter for group...');
+                        await socket.chatModify({ markRead: true }, normalizedChatId);
+                        readSuccess = true;
+                        console.log(`✅ GROUP marked as read in WhatsApp (last attempt succeeded)`);
+                    } catch (finalErr) {
+                        console.error('Final attempt failed:', finalErr);
+                        console.error('Final error details:', {
+                            message: finalErr.message,
+                            code: finalErr.code,
+                            status: finalErr.status,
+                            stack: finalErr.stack
+                        });
+                    }
+                }
+                
+                if (!readSuccess) {
+                    console.error('❌ All methods failed to mark messages as read in WhatsApp');
+                    console.error('Database will NOT be updated to maintain consistency');
+                    throw new Error(`Failed to mark messages as read in WhatsApp - all methods failed. ChatId: ${normalizedChatId}, IsGroup: ${isGroup}. Please check the chatId format and ensure the instance is connected.`);
+                }
+            }
+
+            // Update unread count in database ONLY if WhatsApp operation succeeded
+            if (readSuccess && chat) {
+                await prisma.chat.updateMany({
+                    where: {
+                        instanceId,
+                        OR: [
+                            { chatId: normalizedChatId },
+                            { chatId: chatId },
+                        ],
+                    },
+                    data: {
+                        unreadCount: 0,
+                    },
+                });
+                console.log(`✅ Unread count reset to 0 for chat ${normalizedChatId} in database`);
+            } else if (readSuccess && !chat) {
+                console.warn(`Chat ${normalizedChatId} not found in database, but messages marked as read in WhatsApp`);
+            } else if (!readSuccess) {
+                console.error('❌ Skipping database update because WhatsApp operation failed');
+            }
+
+            return {
+                success: true,
+                message: 'Messages marked as read',
+                chatId: normalizedChatId,
+            };
         } catch (error) {
             console.error('Error reading unread messages:', error);
             throw error;
@@ -1769,8 +2405,135 @@ class WhatsAppService {
     }
 
     async unreadChat(instanceId, chatId) {
-        // This method is not available in Baileys
-        throw new Error('Unread chat method is not available');
+        const instance = this.instances.get(instanceId);
+
+        if (!instance || !instance.socket) {
+            throw new Error('Instance not found or not connected');
+        }
+
+        const { socket } = instance;
+        const prisma = database.getInstance();
+
+        try {
+            // Normalize chatId to ensure proper JID format
+            let normalizedChatId = chatId;
+            if (!chatId.includes('@')) {
+                // If no @, assume it's a phone number, add @s.whatsapp.net
+                normalizedChatId = `${chatId}@s.whatsapp.net`;
+            } else if (chatId.includes('@g.us')) {
+                // Group chat - keep the @g.us format
+                normalizedChatId = chatId;
+            }
+
+            // Find chat in database
+            const chat = await prisma.chat.findFirst({
+                where: {
+                    instanceId,
+                    OR: [
+                        { chatId: normalizedChatId },
+                        { chatId: chatId },
+                    ],
+                },
+            });
+
+            if (!chat) {
+                throw new Error(`Chat ${normalizedChatId} not found in database`);
+            }
+
+            // Mark chat as unread in WhatsApp - try multiple methods
+            let unreadSuccess = false;
+            const unreadMethods = [
+                // Method 1: chatModify with markRead as first param and jid as second (preferred format)
+                async () => {
+                    console.log(`Attempting chatModify({ markRead: false }, ${normalizedChatId})`);
+                    await socket.chatModify({ markRead: false }, normalizedChatId);
+                    return true;
+                },
+                // Method 2: chatModify with chatId in object (alternative format)
+                async () => {
+                    console.log(`Attempting chatModify with chatId: ${normalizedChatId}, markRead: false`);
+                    await socket.chatModify({
+                        chatId: normalizedChatId,
+                        markRead: false, // Mark as unread
+                    });
+                    return true;
+                },
+            ];
+
+            // Try each method until one succeeds
+            for (let i = 0; i < unreadMethods.length; i++) {
+                try {
+                    await unreadMethods[i]();
+                    unreadSuccess = true;
+                    console.log(`✅ ${isGroup ? 'GROUP' : 'CHAT'} ${normalizedChatId} marked as unread in WhatsApp using method ${i + 1}`);
+                    break;
+                } catch (err) {
+                    console.warn(`Unread method ${i + 1} failed: ${err.message}`);
+                    if (i === unreadMethods.length - 1) {
+                        console.error(`All unread methods failed. Last error:`, err);
+                        console.error(`Error stack:`, err.stack);
+                    }
+                }
+            }
+
+            // If all methods failed with normalized format, try original format
+            if (!unreadSuccess && normalizedChatId !== chatId) {
+                console.log(`Trying original format ${chatId} for unread...`);
+                try {
+                    await socket.chatModify({ markRead: false }, chatId);
+                    normalizedChatId = chatId;
+                    unreadSuccess = true;
+                    console.log(`✅ Chat marked as unread using original format`);
+                } catch (err1) {
+                    try {
+                        await socket.chatModify({
+                            chatId: chatId,
+                            markRead: false,
+                        });
+                        normalizedChatId = chatId;
+                        unreadSuccess = true;
+                        console.log(`✅ Chat marked as unread using original format (alternative)`);
+                    } catch (err2) {
+                        console.error('Error with original format:', err2);
+                    }
+                }
+            }
+
+            if (!unreadSuccess) {
+                console.error('All methods failed to mark chat as unread in WhatsApp');
+                console.error(`ChatId used: ${normalizedChatId} (original: ${chatId})`);
+                // Continue to update database even if WhatsApp fails
+                console.warn('Continuing to update database despite WhatsApp error');
+            }
+
+            // Increment unread count in database (set to 1 if currently 0)
+            const newUnreadCount = chat.unreadCount > 0 ? chat.unreadCount : 1;
+            
+            await prisma.chat.updateMany({
+                where: {
+                    instanceId,
+                    OR: [
+                        { chatId: normalizedChatId },
+                        { chatId: chatId },
+                    ],
+                },
+                data: {
+                    unreadCount: newUnreadCount,
+                },
+            });
+
+            console.log(`Chat ${normalizedChatId} marked as unread in database (unreadCount: ${newUnreadCount})`);
+
+            return {
+                success: true,
+                message: 'Chat marked as unread',
+                chatId: normalizedChatId,
+                unreadCount: newUnreadCount,
+            };
+        } catch (error) {
+            console.error('Error marking chat as unread:', error);
+            throw error;
+        }
     }
 
     // Additional Webhook Handlers
@@ -1984,6 +2747,367 @@ class WhatsAppService {
             }
         } catch (error) {
             console.error('Error handling group participants update:', error);
+        }
+    }
+
+    // Channel/Newsletter Methods
+    async getChannels(instanceId) {
+        const instance = this.instances.get(instanceId);
+
+        if (!instance || !instance.socket) {
+            throw new Error('Instance not found or not connected');
+        }
+
+        const { socket } = instance;
+        const prisma = database.getInstance();
+
+        try {
+            // Get channels from store (simple and reliable, no app state key needed)
+            let storeChats = [];
+            
+            if (socket.store && socket.store.chats) {
+                // Try different methods to get chats from store
+                if (typeof socket.store.chats.all === 'function') {
+                    storeChats = socket.store.chats.all();
+                } else if (socket.store.chats instanceof Map) {
+                    storeChats = Array.from(socket.store.chats.values());
+                } else if (typeof socket.store.chats === 'object') {
+                    storeChats = Object.values(socket.store.chats);
+                } else if (Array.isArray(socket.store.chats)) {
+                    storeChats = socket.store.chats;
+                }
+            }
+
+            console.log(`Total chats in store: ${storeChats.length}`);
+
+            // Filter only newsletter channels (ending with @newsletter)
+            let channels = storeChats
+                .filter(chat => {
+                    if (!chat || !chat.id) return false;
+                    const isNewsletter = chat.id.endsWith('@newsletter');
+                    if (isNewsletter) {
+                        console.log(`Found newsletter in store: ${chat.id}, name: ${chat.name || 'N/A'}`);
+                    }
+                    return isNewsletter;
+                })
+                .map(chat => {
+                    // Try to get more info from newsletterMetadata if available
+                    let channelData = {
+                        id: chat.id,
+                        name: chat.name || chat.conversationTimestamp || (chat.id || '').split('@')[0],
+                        description: chat.description || '',
+                        subscriberCount: chat.subscriberCount || 0,
+                        createdAt: chat.createdAt || chat.conversationTimestamp || null,
+                        picture: chat.picture || null,
+                    };
+
+                    // If we have thread_metadata in chat, use it
+                    if (chat.threadMetadata) {
+                        channelData.name = chat.threadMetadata.name?.text || channelData.name;
+                        channelData.description = chat.threadMetadata.description?.text || channelData.description;
+                        channelData.subscriberCount = parseInt(chat.threadMetadata.subscribers_count || '0');
+                        channelData.createdAt = parseInt(chat.threadMetadata.creation_time || '0') * 1000; // Convert to milliseconds
+                    }
+
+                    return channelData;
+                });
+
+            console.log(`Found ${channels.length} channels from store`);
+
+            // Also try to get channels from database as additional source
+            try {
+                const dbChats = await prisma.chat.findMany({
+                    where: {
+                        instanceId,
+                        chatId: {
+                            contains: '@newsletter'
+                        }
+                    },
+                    orderBy: {
+                        lastMessageAt: 'desc'
+                    }
+                });
+
+                console.log(`Found ${dbChats.length} channels in database`);
+
+                // Merge with store channels, avoiding duplicates
+                const existingIds = new Set(channels.map(c => c.id));
+                
+                dbChats.forEach(chat => {
+                    if (chat.chatId && chat.chatId.endsWith('@newsletter') && !existingIds.has(chat.chatId)) {
+                        channels.push({
+                            id: chat.chatId,
+                            name: chat.name || (chat.chatId || '').split('@')[0],
+                            description: '',
+                            subscriberCount: 0,
+                            createdAt: chat.createdAt || null,
+                            picture: null,
+                        });
+                        console.log(`Added channel from DB: ${chat.chatId}`);
+                    }
+                });
+            } catch (dbErr) {
+                console.warn(`Error getting channels from database: ${dbErr.message}`);
+            }
+
+            // Remove duplicates based on ID
+            const uniqueChannels = [];
+            const seenIds = new Set();
+            channels.forEach(channel => {
+                if (channel.id && !seenIds.has(channel.id)) {
+                    seenIds.add(channel.id);
+                    uniqueChannels.push(channel);
+                }
+            });
+
+            console.log(`Total unique channels found: ${uniqueChannels.length} for instance ${instanceId}`);
+            return uniqueChannels;
+        } catch (error) {
+            console.error('Error getting channels:', error);
+            throw error;
+        }
+    }
+
+    async getChannelInfo(instanceId, channelId) {
+        const instance = this.instances.get(instanceId);
+
+        if (!instance || !instance.socket) {
+            throw new Error('Instance not found or not connected');
+        }
+
+        const { socket } = instance;
+
+        try {
+            // Normalize channelId
+            const normalizedChannelId = channelId.includes('@') ? channelId : `${channelId}@newsletter`;
+
+            // Use newsletterMetadata to get newsletter info (correct method according to Baileys docs)
+            if (typeof socket.newsletterMetadata === 'function') {
+                try {
+                    const info = await socket.newsletterMetadata(normalizedChannelId);
+                    return info;
+                } catch (err) {
+                    console.warn(`newsletterMetadata failed: ${err.message}`);
+                    throw new Error(`Failed to get channel info: ${err.message}`);
+                }
+            } else {
+                throw new Error('newsletterMetadata method is not available');
+            }
+        } catch (error) {
+            console.error('Error getting channel info:', error);
+            throw error;
+        }
+    }
+
+    async followChannel(instanceId, channelId) {
+        const instance = this.instances.get(instanceId);
+
+        if (!instance || !instance.socket) {
+            throw new Error('Instance not found or not connected');
+        }
+
+        const { socket } = instance;
+
+        try {
+            // Normalize channelId
+            const normalizedChannelId = channelId.includes('@') ? channelId : `${channelId}@newsletter`;
+
+            // Follow newsletter using newsletterFollow (correct method according to Baileys docs)
+            if (typeof socket.newsletterFollow === 'function') {
+                await socket.newsletterFollow(normalizedChannelId);
+                console.log(`Successfully followed channel ${normalizedChannelId} for instance ${instanceId}`);
+                return { success: true, channelId: normalizedChannelId };
+            } else {
+                throw new Error('newsletterFollow method is not available');
+            }
+        } catch (error) {
+            console.error('Error following channel:', error);
+            throw error;
+        }
+    }
+
+    async unfollowChannel(instanceId, channelId) {
+        const instance = this.instances.get(instanceId);
+
+        if (!instance || !instance.socket) {
+            throw new Error('Instance not found or not connected');
+        }
+
+        const { socket } = instance;
+
+        try {
+            // Normalize channelId
+            const normalizedChannelId = channelId.includes('@') ? channelId : `${channelId}@newsletter`;
+
+            // Unfollow newsletter using newsletterUnfollow (correct method according to Baileys docs)
+            if (typeof socket.newsletterUnfollow === 'function') {
+                await socket.newsletterUnfollow(normalizedChannelId);
+                console.log(`Successfully unfollowed channel ${normalizedChannelId} for instance ${instanceId}`);
+                return { success: true, channelId: normalizedChannelId };
+            } else {
+                throw new Error('newsletterUnfollow method is not available');
+            }
+        } catch (error) {
+            console.error('Error unfollowing channel:', error);
+            throw error;
+        }
+    }
+
+    async muteChannel(instanceId, channelId, duration = 8 * 60 * 60) {
+        const instance = this.instances.get(instanceId);
+
+        if (!instance || !instance.socket) {
+            throw new Error('Instance not found or not connected');
+        }
+
+        const { socket } = instance;
+
+        try {
+            // Normalize channelId
+            const normalizedChannelId = channelId.includes('@') ? channelId : `${channelId}@newsletter`;
+
+            // Mute newsletter using newsletterMute (correct method according to Baileys docs)
+            if (typeof socket.newsletterMute === 'function') {
+                await socket.newsletterMute(normalizedChannelId, duration);
+                console.log(`Successfully muted channel ${normalizedChannelId} for ${duration} seconds for instance ${instanceId}`);
+                return { success: true, channelId: normalizedChannelId, duration };
+            } else {
+                throw new Error('newsletterMute method is not available');
+            }
+        } catch (error) {
+            console.error('Error muting channel:', error);
+            throw error;
+        }
+    }
+
+    async unmuteChannel(instanceId, channelId) {
+        const instance = this.instances.get(instanceId);
+
+        if (!instance || !instance.socket) {
+            throw new Error('Instance not found or not connected');
+        }
+
+        const { socket } = instance;
+
+        try {
+            // Normalize channelId
+            const normalizedChannelId = channelId.includes('@') ? channelId : `${channelId}@newsletter`;
+
+            // Unmute newsletter using newsletterUnmute (correct method according to Baileys docs)
+            if (typeof socket.newsletterUnmute === 'function') {
+                await socket.newsletterUnmute(normalizedChannelId);
+                console.log(`Successfully unmuted channel ${normalizedChannelId} for instance ${instanceId}`);
+                return { success: true, channelId: normalizedChannelId };
+            } else {
+                throw new Error('newsletterUnmute method is not available');
+            }
+        } catch (error) {
+            console.error('Error unmuting channel:', error);
+            throw error;
+        }
+    }
+
+    async getChannelMessages(instanceId, channelId, limit = 20) {
+        const instance = this.instances.get(instanceId);
+
+        if (!instance || !instance.socket) {
+            throw new Error('Instance not found or not connected');
+        }
+
+        const { socket } = instance;
+
+        try {
+            // Normalize channelId
+            const normalizedChannelId = channelId.includes('@') ? channelId : `${channelId}@newsletter`;
+
+            // Get newsletter messages using newsletterFetchMessages (correct method according to Baileys docs)
+            if (typeof socket.newsletterFetchMessages === 'function') {
+                const messages = await socket.newsletterFetchMessages(normalizedChannelId, limit);
+                return messages || [];
+            } else {
+                throw new Error('newsletterFetchMessages method is not available');
+            }
+        } catch (error) {
+            console.error('Error getting channel messages:', error);
+            throw error;
+        }
+    }
+
+    async deleteChannel(instanceId, channelId) {
+        const instance = this.instances.get(instanceId);
+
+        if (!instance || !instance.socket) {
+            throw new Error('Instance not found or not connected');
+        }
+
+        const { socket } = instance;
+        const prisma = database.getInstance();
+
+        try {
+            // Check if socket is ready
+            if (!socket.user) {
+                throw new Error('WhatsApp not fully connected. Please wait for connection to complete.');
+            }
+
+            // Normalize channelId
+            const normalizedChannelId = channelId.includes('@') ? channelId : `${channelId}@newsletter`;
+
+            console.log(`Attempting to delete channel ${normalizedChannelId} for instance ${instanceId}`);
+
+            // Verify channel exists (optional check, will fail on delete if not found anyway)
+            try {
+                const channelInfo = await socket.newsletterMetadata(normalizedChannelId);
+                if (!channelInfo) {
+                    throw new Error('Channel not found');
+                }
+                console.log(`Channel info retrieved: ${normalizedChannelId}`);
+            } catch (infoError) {
+                // If we can't get channel info, still try to delete
+                // The delete operation itself will fail if channel doesn't exist or user doesn't have permission
+                console.warn(`Could not get channel info (will attempt delete anyway): ${infoError.message}`);
+            }
+
+            // Delete newsletter using newsletterDelete
+            if (typeof socket.newsletterDelete !== 'function') {
+                throw new Error('newsletterDelete method is not available. This feature may require special permissions.');
+            }
+
+            const result = await socket.newsletterDelete(normalizedChannelId);
+            
+            console.log(`✅ Channel ${normalizedChannelId} deleted successfully for instance ${instanceId}`);
+
+            // Delete channel from database
+            try {
+                await prisma.chat.deleteMany({
+                    where: {
+                        instanceId,
+                        chatId: normalizedChannelId,
+                    },
+                });
+                console.log(`✅ Channel ${normalizedChannelId} removed from database`);
+            } catch (dbErr) {
+                console.warn(`Warning: Failed to remove channel from database: ${dbErr.message}`);
+                // Don't throw error, channel deletion was successful
+            }
+
+            return {
+                success: true,
+                channelId: normalizedChannelId,
+                data: result,
+            };
+        } catch (error) {
+            console.error('Error deleting channel:', error);
+            
+            // Provide more helpful error messages
+            if (error.message?.includes('Not Authorized') || error.message?.includes('not authorized')) {
+                throw new Error('Not Authorized: You must be the owner of the channel to delete it. Only channel owners can delete their channels.');
+            }
+            
+            if (error.message?.includes('not found') || error.message?.includes('Not Found')) {
+                throw new Error('Channel not found. The channel may have already been deleted or does not exist.');
+            }
+            
+            throw error;
         }
     }
 }

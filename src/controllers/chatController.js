@@ -3,14 +3,32 @@ const whatsappService = require('../services/whatsappService');
 exports.getChats = async (req, res) => {
     try {
         const { instanceId } = req.params;
+        const { sortBy, sortOrder, limit, offset } = req.query;
 
-        const chats = await whatsappService.getChats(instanceId);
+        // Build options object
+        const options = {};
+        if (sortBy) options.sortBy = sortBy;
+        if (sortOrder) options.sortOrder = sortOrder;
+        if (limit) options.limit = parseInt(limit);
+        if (offset) options.offset = parseInt(offset);
 
-        res.json({
-            success: true,
-            data: chats,
-            count: chats.length,
-        });
+        const result = await whatsappService.getChats(instanceId, options);
+
+        // If result is already an object with data property (new format), use it directly
+        // Otherwise, wrap it in the old format for backward compatibility
+        if (result && result.data) {
+            res.json({
+                success: true,
+                ...result
+            });
+        } else {
+            // Backward compatibility: if service returns array directly
+            res.json({
+                success: true,
+                data: result,
+                count: Array.isArray(result) ? result.length : 0,
+            });
+        }
     } catch (error) {
         console.error('Error getting chats:', error);
         res.status(500).json({
@@ -166,23 +184,11 @@ exports.readUnreadMessages = async (req, res) => {
         if (!instanceId || !chatId) {
             return res.status(400).json({
                 success: false,
-                error: 'instanceId or chatId are required',
+                error: 'instanceId and chatId are required',
             });
         }
 
-        const instance = whatsappService.getInstance(instanceId);
-        if (!instance || !instance.socket) {
-            return res.status(404).json({
-                success: false,
-                error: 'Instance not found or not connected',
-            });
-        }
-
-        const jid = chatId.includes('@') ? chatId : `${chatId}@s.whatsapp.net`;
-        const result = await instance.socket.chatModify({
-            jid,
-            markRead: true,
-        });
+        const result = await whatsappService.readUnreadMessages(instanceId, chatId);
 
         res.json({
             success: true,
@@ -358,6 +364,13 @@ exports.unreadChat = async (req, res) => {
     try {
         const { instanceId, chatId } = req.params;
 
+        if (!instanceId || !chatId) {
+            return res.status(400).json({
+                success: false,
+                error: 'instanceId and chatId are required',
+            });
+        }
+
         const result = await whatsappService.unreadChat(instanceId, chatId);
 
         res.json({
@@ -366,6 +379,15 @@ exports.unreadChat = async (req, res) => {
         });
     } catch (error) {
         console.error('Error marking chat as unread:', error);
+        
+        // Check if it's a not found error
+        if (error.message && error.message.includes('not found')) {
+            return res.status(404).json({
+                success: false,
+                error: error.message || 'Chat not found',
+            });
+        }
+
         res.status(500).json({
             success: false,
             error: error.message || 'Failed to mark chat as unread',

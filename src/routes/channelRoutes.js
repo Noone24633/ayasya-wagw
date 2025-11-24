@@ -9,6 +9,9 @@ router.use(apiKeyAuth);
 // Get list of known channels (subscribed newsletters)
 router.get('/:instanceId', channelController.getChannels);
 
+// Refresh/Sync channels - Force refresh from WhatsApp
+router.post('/:instanceId/refresh', channelController.refreshChannels);
+
 // Create a new channel (newsletter) - if user has permission
 router.post('/:instanceId', channelController.createChannel);
 
