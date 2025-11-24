@@ -28,17 +28,8 @@ router.post('/send/link-preview', advancedMessageController.sendLinkPreview);
 
 // ============= INTERACTIVE MESSAGES ROUTES =============
 
-// Send list message
-router.post('/send/list', advancedMessageController.sendListMessage);
-
-// Send button reply message
-router.post('/send/buttons', advancedMessageController.sendButtonReply);
-
 // Send poll
 router.post('/send/poll', advancedMessageController.sendPoll);
-
-// Send poll vote
-router.post('/send/poll-vote', advancedMessageController.sendPollVote);
 
 // ============= LOCATION & CONTACT ROUTES =============
 

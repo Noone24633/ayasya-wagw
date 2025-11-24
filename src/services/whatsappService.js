@@ -40,6 +40,7 @@ class WhatsAppService {
                 connectTimeoutMs: 60000,
                 emitOwnEvents: true,
                 generateHighQualityLinkPreview: true,
+                syncFullHistory: true,
                 logger: {
                     level: 'error',
                     trace: () => {},
@@ -198,10 +199,16 @@ class WhatsAppService {
             if (qr) {
                 const qrCode = await qrcode.toDataURL(qr);
 
-                // Update instance in database
-                await prisma.instance.update({
+                // Update or create instance in database
+                await prisma.instance.upsert({
                     where: { id: instanceId },
-                    data: {
+                    update: {
+                        status: 'qr',
+                        qrCode: qrCode,
+                    },
+                    create: {
+                        id: instanceId,
+                        name: `Instance ${instanceId}`,
                         status: 'qr',
                         qrCode: qrCode,
                     },
@@ -226,9 +233,16 @@ class WhatsAppService {
                 console.log(`Connection closed for instance ${instanceId}. Should reconnect: ${shouldReconnect}`);
 
                 // Update status in database
-                await prisma.instance.update({
+                await prisma.instance.upsert({
                     where: { id: instanceId },
-                    data: {
+                    update: {
+                        status: 'disconnected',
+                        qrCode: null,
+                        pairingCode: null,
+                    },
+                    create: {
+                        id: instanceId,
+                        name: `Instance ${instanceId}`,
                         status: 'disconnected',
                         qrCode: null,
                         pairingCode: null,
@@ -283,11 +297,18 @@ class WhatsAppService {
                 const user = socket.user;
 
                 // Update instance in database
-                await prisma.instance.update({
+                await prisma.instance.upsert({
                     where: { id: instanceId },
-                    data: {
+                    update: {
                         status: 'connected',
-                        phoneNumber: user?.id?.split('@')[0] || null,
+                        phoneNumber: (user?.id || '').split('@')[0] || null,
+                        qrCode: null,
+                    },
+                    create: {
+                        id: instanceId,
+                        name: `Instance ${instanceId}`,
+                        status: 'connected',
+                        phoneNumber: (user?.id || '').split('@')[0] || null,
                         qrCode: null,
                     },
                 });
@@ -316,16 +337,21 @@ class WhatsAppService {
 
                 // Trigger webhook for session status change using new service
                 await webhookService.triggerSessionStatus(instanceId, 'connected', {
-                    phoneNumber: user?.id?.split('@')[0] || null,
+                    phoneNumber: (user?.id || '').split('@')[0] || null,
                 });
             }
 
             if (connection === 'connecting') {
                 console.log(`Connecting instance ${instanceId}...`);
 
-                await prisma.instance.update({
+                await prisma.instance.upsert({
                     where: { id: instanceId },
-                    data: {
+                    update: {
+                        status: 'connecting',
+                    },
+                    create: {
+                        id: instanceId,
+                        name: `Instance ${instanceId}`,
                         status: 'connecting',
                     },
                 });
@@ -398,7 +424,7 @@ class WhatsAppService {
                         data: {
                             instanceId,
                             chatId,
-                            name: pushName || chatId.split('@')[0],
+                            name: pushName || (chatId || '').split('@')[0],
                             isGroup,
                             lastMessage: body,
                             lastMessageAt: timestamp,
@@ -650,7 +676,7 @@ class WhatsAppService {
         try {
             for (const chat of chats) {
                 const chatId = chat.id;
-                const name = chat.name || chat.id.split('@')[0];
+                const name = chat.name || (chat.id || '').split('@')[0];
                 const isGroup = chatId.endsWith('@g.us');
                 const archived = chat.archived || false;
                 const unreadCount = chat.unreadCount || 0;
@@ -819,9 +845,14 @@ class WhatsAppService {
 
             // Update instance in database
             const prisma = database.getInstance();
-            await prisma.instance.update({
+            await prisma.instance.upsert({
                 where: { id: instanceId },
-                data: {
+                update: {
+                    pairingCode: pairingCode,
+                },
+                create: {
+                    id: instanceId,
+                    name: `Instance ${instanceId}`,
                     pairingCode: pairingCode,
                 },
             });
@@ -930,7 +961,7 @@ class WhatsAppService {
                 const storeChats = socket.store.chats.all();
                 const chatsData = storeChats.map((chat) => ({
                     id: chat.id,
-                    name: chat.name || chat.id.split('@')[0],
+                    name: chat.name || (chat.id || '').split('@')[0],
                     isGroup: chat.id.endsWith('@g.us'),
                     archived: chat.archived || false,
                     unreadCount: chat.unreadCount || 0,
@@ -1258,7 +1289,7 @@ class WhatsAppService {
                 const callData = {
                     callId: call.id,
                     from: call.from,
-                    fromName: call.pushName || call.from.split('@')[0],
+                    fromName: call.pushName || (call.from || '').split('@')[0],
                     isVideo: call.isVideo || false,
                     isGroup: call.isGroup || false,
                     timestamp: new Date().toISOString(),
@@ -1328,7 +1359,7 @@ class WhatsAppService {
                 },
             });
 
-            const chatName = chat?.name || chatId.split('@')[0];
+            const chatName = chat?.name || (chatId || '').split('@')[0];
 
             if (type === 'add') {
                 // Label added to chat

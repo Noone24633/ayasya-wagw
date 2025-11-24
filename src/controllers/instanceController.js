@@ -1,3 +1,4 @@
+const database = require('../config/database');
 const { prisma } = require('../config/database');
 const sessionManager = require('../services/sessionManager');
 const whatsappService = require('../services/whatsappService');
@@ -146,21 +147,46 @@ class InstanceController {
         try {
             const { instanceId } = req.params;
 
-            const pairingCode = whatsappService.getPairingCode(instanceId);
+            const instance = whatsappService.getInstance(instanceId);
 
-            if (!pairingCode) {
+            if (!instance) {
                 return res.status(404).json({
                     success: false,
-                    error: 'Pairing code not available',
+                    error: 'Instance not found or not connected',
                 });
             }
 
-            res.json({
-                success: true,
-                data: {
-                    pairingCode,
-                    message: 'Current pairing code',
-                },
+            const prisma = database.getInstance();
+            const user = await prisma.instance.findUnique({
+                where: { id: instanceId },
+            });
+
+            const number = user.phoneNumber.includes('@') ? user.phoneNumber : `${user.phoneNumber}@s.whatsapp.net`;
+            console.log('number', number);
+
+            if (!instance.socket.authState.creds.registered) {
+                const code = await instance.socket.requestPairingCode(number);
+                console.log(code);
+
+                if (!code) {
+                    return res.status(404).json({
+                        success: false,
+                        error: 'Pairing code not available',
+                    });
+                }
+
+                return res.json({
+                    success: true,
+                    data: {
+                        code,
+                        message: 'Current pairing code',
+                    },
+                });
+            }
+
+            return res.status(400).json({
+                success: false,
+                error: 'Instance is already registered',
             });
         } catch (error) {
             console.error('Error getting pairing code:', error);

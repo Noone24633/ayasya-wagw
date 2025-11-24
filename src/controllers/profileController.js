@@ -48,12 +48,12 @@ class ProfileController {
             }
 
             const profile = {
-                id: socket.user.id,
-                name: socket.user.name || socket.user.verifiedName || 'Unknown',
-                phone: socket.user.id.split('@')[0].replace(':', '+'),
+                id: socket.user?.id || null,
+                name: socket.user?.name || socket.user?.verifiedName || 'Unknown',
+                phone: (socket.user?.id || '').split('@')[0].replace(':', '+') || null,
                 profilePicture: profilePictureUrl,
                 status: status,
-                platform: socket.user.platform || 'unknown',
+                platform: socket.user?.platform || 'unknown',
             };
 
             res.json({
