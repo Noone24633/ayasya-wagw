@@ -220,6 +220,13 @@ exports.deleteMessage = async (req, res) => {
     try {
         const { instanceId, chatId, messageId } = req.params;
 
+        if (!instanceId || !chatId || !messageId) {
+            return res.status(400).json({
+                success: false,
+                error: 'instanceId, chatId, and messageId are required',
+            });
+        }
+
         const result = await whatsappService.deleteMessage(instanceId, chatId, messageId);
 
         res.json({
@@ -228,6 +235,15 @@ exports.deleteMessage = async (req, res) => {
         });
     } catch (error) {
         console.error('Error deleting message:', error);
+        
+        // Check if it's a not found error
+        if (error.message && error.message.includes('not found')) {
+            return res.status(404).json({
+                success: false,
+                error: error.message || 'Message not found',
+            });
+        }
+
         res.status(500).json({
             success: false,
             error: error.message || 'Failed to delete message',

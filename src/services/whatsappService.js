@@ -1601,21 +1601,91 @@ class WhatsAppService {
         const prisma = database.getInstance();
 
         try {
-            // Delete from WhatsApp
-            await socket.sendMessage(chatId, {
-                delete: {
-                    remoteJid: chatId,
-                    fromMe: true,
-                    id: messageId,
+            // Normalize chatId to ensure proper JID format
+            let normalizedChatId = chatId;
+            if (!chatId.includes('@')) {
+                // If no @, assume it's a phone number, add @s.whatsapp.net
+                normalizedChatId = `${chatId}@s.whatsapp.net`;
+            }
+
+            // Verify message exists in database first
+            const existingMessage = await prisma.message.findFirst({
+                where: {
+                    instanceId,
+                    messageId,
+                },
+                include: {
+                    chat: {
+                        select: {
+                            chatId: true,
+                        },
+                    },
                 },
             });
 
+            if (!existingMessage) {
+                throw new Error(`Message ${messageId} not found in database`);
+            }
+
+            // Determine if message is from me or not
+            const fromMe = existingMessage.fromMe;
+
+            // Delete from WhatsApp
+            try {
+                await socket.sendMessage(normalizedChatId, {
+                    delete: {
+                        remoteJid: normalizedChatId,
+                        fromMe: fromMe,
+                        id: messageId,
+                    },
+                });
+                console.log(`Message ${messageId} deleted from WhatsApp (fromMe: ${fromMe})`);
+            } catch (whatsappError) {
+                // If WhatsApp deletion fails, try with original chatId
+                if (normalizedChatId !== chatId) {
+                    try {
+                        await socket.sendMessage(chatId, {
+                            delete: {
+                                remoteJid: chatId,
+                                fromMe: fromMe,
+                                id: messageId,
+                            },
+                        });
+                        console.log(`Message ${messageId} deleted from WhatsApp (using original format)`);
+                    } catch (err) {
+                        console.error('Error deleting message from WhatsApp:', err);
+                        // Continue to delete from database even if WhatsApp deletion fails
+                        console.warn('Continuing to delete from database despite WhatsApp error');
+                    }
+                } else {
+                    console.error('Error deleting message from WhatsApp:', whatsappError);
+                    // Continue to delete from database even if WhatsApp deletion fails
+                    console.warn('Continuing to delete from database despite WhatsApp error');
+                }
+            }
+
             // Delete from database
-            await prisma.message.deleteMany({
-                where: { messageId },
+            const deletedMessages = await prisma.message.deleteMany({
+                where: {
+                    instanceId,
+                    messageId,
+                },
             });
 
-            return { success: true, message: 'Message deleted successfully' };
+            if (deletedMessages.count === 0) {
+                throw new Error(`Message ${messageId} not found in database to delete`);
+            }
+
+            console.log(`Message ${messageId} deleted from database (${deletedMessages.count} message(s))`);
+
+            return {
+                success: true,
+                message: 'Message deleted successfully',
+                deleted: {
+                    messageId,
+                    count: deletedMessages.count,
+                },
+            };
         } catch (error) {
             console.error('Error deleting message:', error);
             throw error;
