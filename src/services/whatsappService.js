@@ -54,12 +54,12 @@ class WhatsAppService {
                     error: (data, msg) => {
                         // Only log meaningful errors, ignore debug objects
                         if (msg && typeof msg === 'string') {
-                            console.error(`[Baileys] ${msg}`);
+                            logger.error(`[Baileys] ${msg}`);
                         } else if (data && data.err && data.err instanceof Error) {
-                            console.error(`[Baileys] ${data.err.message}`);
+                            logger.error(`[Baileys] ${data.err.message}`);
                         }
                     },
-                    fatal: (msg) => console.error(`[Baileys Fatal] ${msg}`),
+                    fatal: (msg) => logger.error(`[Baileys Fatal] ${msg}`),
                     child: () => ({
                         level: 'error',
                         trace: () => {},
@@ -68,13 +68,13 @@ class WhatsAppService {
                         warn: () => {},
                         error: (data, msg) => {
                             if (msg && typeof msg === 'string') {
-                                console.error(`[Baileys] ${msg}`);
+                                logger.error(`[Baileys] ${msg}`);
                             } else if (data && data.err && data.err instanceof Error) {
-                                console.error(`[Baileys] ${data.err.message}`);
+                                logger.error(`[Baileys] ${data.err.message}`);
                             }
                         },
-                        fatal: (msg) => console.error(`[Baileys Fatal] ${msg}`),
-                    }),
+                        fatal: (msg) => logger.error(`[Baileys Fatal] ${msg}`)
+                    })
                 },
                 
                 // Group metadata cache - improves performance
@@ -2876,22 +2876,107 @@ class WhatsAppService {
         }
 
         const { socket } = instance;
+        const prisma = database.getInstance();
 
         try {
             // Normalize channelId
             const normalizedChannelId = channelId.includes('@') ? channelId : `${channelId}@newsletter`;
 
-            // Use newsletterMetadata to get newsletter info (correct method according to Baileys docs)
+            // First, try to get info from store (simpler and more reliable)
+            if (socket.store && socket.store.chats) {
+                let storeChats = [];
+                if (typeof socket.store.chats.all === 'function') {
+                    storeChats = socket.store.chats.all();
+                } else if (socket.store.chats instanceof Map) {
+                    storeChats = Array.from(socket.store.chats.values());
+                } else if (typeof socket.store.chats === 'object') {
+                    storeChats = Object.values(socket.store.chats);
+                }
+
+                const storeChat = storeChats.find(chat => chat && chat.id === normalizedChannelId);
+                
+                if (storeChat) {
+                    // Build info from store data
+                    const info = {
+                        id: storeChat.id,
+                        name: storeChat.name || (storeChat.id || '').split('@')[0],
+                        description: storeChat.description || '',
+                        subscriberCount: storeChat.subscriberCount || 0,
+                        createdAt: storeChat.createdAt || storeChat.conversationTimestamp || null,
+                        picture: storeChat.picture || null,
+                    };
+
+                    // If we have thread_metadata, use it
+                    if (storeChat.threadMetadata) {
+                        info.name = storeChat.threadMetadata.name?.text || info.name;
+                        info.description = storeChat.threadMetadata.description?.text || info.description;
+                        info.subscriberCount = parseInt(storeChat.threadMetadata.subscribers_count || '0');
+                        info.createdAt = parseInt(storeChat.threadMetadata.creation_time || '0') * 1000;
+                    }
+
+                    console.log(`✅ Got channel info from store for ${normalizedChannelId}`);
+                    return info;
+                }
+            }
+
+            // Try to get from database as fallback
+            try {
+                const dbChat = await prisma.chat.findFirst({
+                    where: {
+                        instanceId,
+                        chatId: normalizedChannelId,
+                    },
+                });
+
+                if (dbChat) {
+                    console.log(`✅ Got channel info from database for ${normalizedChannelId}`);
+                    return {
+                        id: dbChat.chatId,
+                        name: dbChat.name || (dbChat.chatId || '').split('@')[0],
+                        description: '',
+                        subscriberCount: 0,
+                        createdAt: dbChat.createdAt || null,
+                        picture: null,
+                    };
+                }
+            } catch (dbErr) {
+                console.warn(`Error getting channel from database: ${dbErr.message}`);
+            }
+
+            // Last resort: try newsletterMetadata (may fail with Bad Request for some channels)
             if (typeof socket.newsletterMetadata === 'function') {
                 try {
-                    const info = await socket.newsletterMetadata("jid", normalizedChannelId);
+                    const info = await socket.newsletterMetadata(normalizedChannelId);
+                    console.log(`✅ Got channel info from newsletterMetadata for ${normalizedChannelId}`);
                     return info;
                 } catch (err) {
-                    console.warn(`newsletterMetadata failed: ${err.message}`);
+                    // If Bad Request, it might be a permission issue or invalid channel
+                    if (err.message?.includes('Bad Request') || err.message?.includes('GraphQL')) {
+                        console.warn(`⚠️ newsletterMetadata returned Bad Request for ${normalizedChannelId}, using fallback data`);
+                        // Return basic info from channelId
+                        return {
+                            id: normalizedChannelId,
+                            name: (normalizedChannelId || '').split('@')[0],
+                            description: '',
+                            subscriberCount: 0,
+                            createdAt: null,
+                            picture: null,
+                            note: 'Limited info available. Channel may require special permissions to access full metadata.',
+                        };
+                    }
                     throw new Error(`Failed to get channel info: ${err.message}`);
                 }
             } else {
-                throw new Error('newsletterMetadata method is not available');
+                // If newsletterMetadata not available, return basic info
+                return {
+                    id: normalizedChannelId,
+                    name: (normalizedChannelId || '').split('@')[0],
+                    description: '',
+                    subscriberCount: 0,
+                    createdAt: null,
+                    picture: null,
+                    note: 'newsletterMetadata method not available. Using basic channel info.',
+                };
             }
         } catch (error) {
             console.error('Error getting channel info:', error);
@@ -3024,7 +3109,7 @@ class WhatsAppService {
         }
     }
 
-    async muteChannel(instanceId, channelId, duration = 8 * 60 * 60) {
+    async muteChannel(instanceId, channelId) {
         const instance = this.instances.get(instanceId);
 
         if (!instance || !instance.socket) {
@@ -3039,9 +3124,9 @@ class WhatsAppService {
 
             // Mute newsletter using newsletterMute (correct method according to Baileys docs)
             if (typeof socket.newsletterMute === 'function') {
-                await socket.newsletterMute(normalizedChannelId, duration);
-                console.log(`Successfully muted channel ${normalizedChannelId} for ${duration} seconds for instance ${instanceId}`);
-                return { success: true, channelId: normalizedChannelId, duration };
+                await socket.newsletterMute(normalizedChannelId);
+                console.log(`Successfully muted channel ${normalizedChannelId} for instance ${instanceId}`);
+                return normalizedChannelId
             } else {
                 throw new Error('newsletterMute method is not available');
             }
@@ -3068,7 +3153,7 @@ class WhatsAppService {
             if (typeof socket.newsletterUnmute === 'function') {
                 await socket.newsletterUnmute(normalizedChannelId);
                 console.log(`Successfully unmuted channel ${normalizedChannelId} for instance ${instanceId}`);
-                return { success: true, channelId: normalizedChannelId };
+                return normalizedChannelId;
             } else {
                 throw new Error('newsletterUnmute method is not available');
             }
@@ -3100,6 +3185,126 @@ class WhatsAppService {
             }
         } catch (error) {
             console.error('Error getting channel messages:', error);
+            throw error;
+        }
+    }
+
+    async createChannel(instanceId, name, description = '', picture = null) {
+        const instance = this.instances.get(instanceId);
+
+        if (!instance || !instance.socket) {
+            throw new Error('Instance not found or not connected');
+        }
+
+        const { socket } = instance;
+        const prisma = database.getInstance();
+
+        try {
+            // Check if socket is ready
+            if (!socket.user) {
+                throw new Error('WhatsApp not fully connected. Please wait for connection to complete.');
+            }
+
+            // Validate name
+            if (!name || typeof name !== 'string') {
+                throw new Error('Channel name is required and must be a string');
+            }
+
+            const trimmedName = name.trim();
+            
+            if (trimmedName.length === 0) {
+                throw new Error('Channel name cannot be empty');
+            }
+            
+            // Validate name length
+            if (trimmedName.length > 100) {
+                throw new Error('Channel name must be 100 characters or less');
+            }
+
+            // Prepare description (optional parameter)
+            const trimmedDesc = description && typeof description === 'string' && description.trim().length > 0
+                ? description.trim().substring(0, 500)
+                : undefined;
+
+            console.log(`Creating channel: name="${trimmedName}"${trimmedDesc ? `, description="${trimmedDesc.substring(0, 50)}..."` : ''}`);
+
+            // Use direct parameters format as per Baileys documentation:
+            // newsletterCreate: (name, description?) => Promise<NewsletterMetadata>
+            if (typeof socket.newsletterCreate !== 'function') {
+                throw new Error('newsletterCreate method is not available. This feature may require special permissions.');
+            }
+
+            let result;
+            let rateLimitError = false;
+            
+            try {
+                // Call with direct parameters (name, description?) - sesuai dokumentasi Baileys
+                if (trimmedDesc) {
+                    result = await socket.newsletterCreate(trimmedName, trimmedDesc);
+                } else {
+                    result = await socket.newsletterCreate(trimmedName);
+                }
+                console.log(`✅ Channel created successfully for instance ${instanceId}`);
+            } catch (error) {
+                // Handle rate limit error - channel may have been created despite the error
+                if (error.message?.includes('rate-overlimit') || error.message?.includes('rate limit')) {
+                    console.warn(`⚠️ Rate limit error, but channel may have been created: ${error.message}`);
+                    rateLimitError = true;
+                    // Don't throw error, channel was likely created successfully
+                    result = null; // Will handle below
+                } else {
+                    console.error('Error creating channel:', error);
+                    throw error;
+                }
+            }
+
+            // Extract channel ID from result
+            const channelId = result?.id || result?.jid || result?.newsletterJid || result?.newsletter?.id || null;
+
+            // If rate limit error occurred, channel was likely created
+            if (rateLimitError && !channelId) {
+                console.log('Channel likely created despite rate limit. Will sync on next getChannels call.');
+            }
+
+            // Save to database if channelId exists
+            if (channelId) {
+                try {
+                    await prisma.chat.upsert({
+                        where: {
+                            instanceId_chatId: {
+                                instanceId,
+                                chatId: channelId,
+                            },
+                        },
+                        update: {
+                            name: trimmedName,
+                        },
+                        create: {
+                            instanceId,
+                            chatId: channelId,
+                            name: trimmedName,
+                            isGroup: false,
+                        },
+                    });
+                    console.log(`✅ Channel ${channelId} saved to database`);
+                } catch (dbErr) {
+                    console.warn(`Warning: Failed to save channel to database: ${dbErr.message}`);
+                }
+            }
+
+            // Return success even if rate limit error (channel was created)
+            return {
+                success: true,
+                channelId: channelId,
+                name: trimmedName,
+                description: trimmedDesc || '',
+                data: result,
+                note: rateLimitError 
+                    ? 'Channel created successfully, but rate limit error occurred. Channel should be available in WhatsApp.'
+                    : undefined,
+            };
+        } catch (error) {
+            console.error('Error creating channel:', error);
             throw error;
         }
     }

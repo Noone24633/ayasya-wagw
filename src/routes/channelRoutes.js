@@ -36,19 +36,4 @@ router.post('/:instanceId/:channelId/mute', channelController.muteChannel);
 // Unmute a channel
 router.post('/:instanceId/:channelId/unmute', channelController.unmuteChannel);
 
-// Search channels by text (not supported in Baileys)
-router.post('/:instanceId/search/by-text', channelController.searchChannelsByText);
-
-// Search channels by view (not supported in Baileys)
-router.post('/:instanceId/search/by-view', channelController.searchChannelsByView);
-
-// Get search views list (not supported in Baileys)
-router.get('/search/views', channelController.getSearchViews);
-
-// Get search countries list (not supported in Baileys)
-router.get('/search/countries', channelController.getSearchCountries);
-
-// Get search categories list (not supported in Baileys)
-router.get('/search/categories', channelController.getSearchCategories);
-
 module.exports = router;
