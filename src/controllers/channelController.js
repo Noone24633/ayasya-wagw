@@ -54,7 +54,7 @@ exports.followChannel = async (req, res, next) => {
       res.json({
         success: true,
         message: 'Successfully followed channel',
-        channelId: result.channelId
+        channelId: result
       });
     } catch (error) {
       console.error('Error following channel:', error);

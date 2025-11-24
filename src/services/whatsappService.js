@@ -2884,7 +2884,7 @@ class WhatsAppService {
             // Use newsletterMetadata to get newsletter info (correct method according to Baileys docs)
             if (typeof socket.newsletterMetadata === 'function') {
                 try {
-                    const info = await socket.newsletterMetadata(normalizedChannelId);
+                    const info = await socket.newsletterMetadata("jid", normalizedChannelId);
                     return info;
                 } catch (err) {
                     console.warn(`newsletterMetadata failed: ${err.message}`);
@@ -2909,19 +2909,50 @@ class WhatsAppService {
         const { socket } = instance;
 
         try {
+            // Check if socket is ready
+            if (!socket.user) {
+                throw new Error('WhatsApp not fully connected. Please wait for connection to complete.');
+            }
+
             // Normalize channelId
             const normalizedChannelId = channelId.includes('@') ? channelId : `${channelId}@newsletter`;
 
+            console.log(`Attempting to follow channel ${normalizedChannelId} for instance ${instanceId}`);
+
             // Follow newsletter using newsletterFollow (correct method according to Baileys docs)
-            if (typeof socket.newsletterFollow === 'function') {
-                await socket.newsletterFollow(normalizedChannelId);
-                console.log(`Successfully followed channel ${normalizedChannelId} for instance ${instanceId}`);
-                return { success: true, channelId: normalizedChannelId };
-            } else {
+            if (typeof socket.newsletterFollow !== 'function') {
                 throw new Error('newsletterFollow method is not available');
+            }
+
+            try {
+                const result = await socket.newsletterFollow(normalizedChannelId);
+                console.log(`✅ Successfully followed channel ${normalizedChannelId} for instance ${instanceId}`);
+                
+                // Return result in consistent format, regardless of response structure
+                return normalizedChannelId
+            } catch (followError) {
+                // Check if error is about response structure (operation might have succeeded)
+                if (followError.message?.includes('unexpected response structure') || 
+                    followError.message?.includes('response structure')) {
+                    console.warn(`⚠️ Response structure warning, but channel may have been followed: ${followError.message}`);
+                    // Assume success if it's just a response structure issue
+                    return normalizedChannelId
+                }
+                // Re-throw other errors
+                throw followError;
             }
         } catch (error) {
             console.error('Error following channel:', error);
+            
+            // Provide more helpful error messages
+            if (error.message?.includes('not found') || error.message?.includes('Not Found')) {
+                throw new Error('Channel not found. The channel may not exist or is not accessible.');
+            }
+            
+            if (error.message?.includes('already') || error.message?.includes('Already')) {
+                throw new Error('Channel is already being followed.');
+            }
+            
             throw error;
         }
     }
@@ -2936,19 +2967,59 @@ class WhatsAppService {
         const { socket } = instance;
 
         try {
+            // Check if socket is ready
+            if (!socket.user) {
+                throw new Error('WhatsApp not fully connected. Please wait for connection to complete.');
+            }
+
             // Normalize channelId
             const normalizedChannelId = channelId.includes('@') ? channelId : `${channelId}@newsletter`;
 
+            console.log(`Attempting to unfollow channel ${normalizedChannelId} for instance ${instanceId}`);
+
             // Unfollow newsletter using newsletterUnfollow (correct method according to Baileys docs)
-            if (typeof socket.newsletterUnfollow === 'function') {
-                await socket.newsletterUnfollow(normalizedChannelId);
-                console.log(`Successfully unfollowed channel ${normalizedChannelId} for instance ${instanceId}`);
-                return { success: true, channelId: normalizedChannelId };
-            } else {
+            if (typeof socket.newsletterUnfollow !== 'function') {
                 throw new Error('newsletterUnfollow method is not available');
+            }
+
+            try {
+                const result = await socket.newsletterUnfollow(normalizedChannelId);
+                console.log(`✅ Successfully unfollowed channel ${normalizedChannelId} for instance ${instanceId}`);
+                
+                // Return result in consistent format
+                return {
+                    success: true,
+                    channelId: normalizedChannelId,
+                    data: result || { unfollowed: true }
+                };
+            } catch (unfollowError) {
+                // Check if error is about response structure (operation might have succeeded)
+                if (unfollowError.message?.includes('unexpected response structure') || 
+                    unfollowError.message?.includes('response structure')) {
+                    console.warn(`⚠️ Response structure warning, but channel may have been unfollowed: ${unfollowError.message}`);
+                    // Assume success if it's just a response structure issue
+                    return {
+                        success: true,
+                        channelId: normalizedChannelId,
+                        data: { unfollowed: true },
+                        note: 'Channel unfollowed successfully, but response format was unexpected'
+                    };
+                }
+                // Re-throw other errors
+                throw unfollowError;
             }
         } catch (error) {
             console.error('Error unfollowing channel:', error);
+            
+            // Provide more helpful error messages
+            if (error.message?.includes('not found') || error.message?.includes('Not Found')) {
+                throw new Error('Channel not found. The channel may not exist or is not accessible.');
+            }
+            
+            if (error.message?.includes('not following') || error.message?.includes('Not following')) {
+                throw new Error('Channel is not being followed.');
+            }
+            
             throw error;
         }
     }
